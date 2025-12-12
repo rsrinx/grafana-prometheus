@@ -1,0 +1,595 @@
+# 🔍 Визуальный гид по работе с распределённой трассировкой
+## От проблемы до решения: полный workflow
+
+---
+
+## 📊 Часть 1: Как создаётся трассировка
+
+### Сценарий: Пользователь делает заказ в интернет-магазине
+
+```
+🧑 Пользователь нажимает "Купить"
+    ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 1️⃣  FRONTEND (браузер)                                          │
+│                                                                 │
+│ - Генерирует новый Trace ID: "abc123xyz"                       │
+│ - Создаёт Span #1: "POST /api/checkout"                        │
+│   • span_id: "span-001"                                         │
+│   • parent_id: null (это корневой span)                         │
+│   • start_time: 10:00:00.000                                    │
+│                                                                 │
+│ - Отправляет HTTP запрос с заголовками:                         │
+│   traceparent: 00-abc123xyz-span001-01                         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+    ↓ HTTP Request + заголовки
+┌─────────────────────────────────────────────────────────────────┐
+│ 2️⃣  API GATEWAY                                                 │
+│                                                                 │
+│ - Читает заголовок: trace_id = "abc123xyz"                     │
+│ - Создаёт Span #2: "gateway.process"                           │
+│   • span_id: "span-002"                                         │
+│   • parent_id: "span-001"                                       │
+│   • trace_id: "abc123xyz" (наследуется!)                       │
+│   • start_time: 10:00:00.050                                    │
+│                                                                 │
+│ - Перенаправляет запрос дальше с заголовками:                   │
+│   traceparent: 00-abc123xyz-span002-01                         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+    ↓ HTTP Request
+┌─────────────────────────────────────────────────────────────────┐
+│ 3️⃣  ORDER SERVICE                                               │
+│                                                                 │
+│ - Читает: trace_id = "abc123xyz"                               │
+│ - Создаёт Span #3: "order.create"                              │
+│   • span_id: "span-003"                                         │
+│   • parent_id: "span-002"                                       │
+│   • start_time: 10:00:00.100                                    │
+│                                                                 │
+│ - Делает 2 параллельных запроса:                                │
+│   ├─> Inventory Service (проверка остатков)                     │
+│   └─> Payment Service (оплата)                                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+    ↓                              ↓
+┌──────────────────────┐    ┌──────────────────────┐
+│ 4️⃣  INVENTORY SERVICE │    │ 5️⃣  PAYMENT SERVICE   │
+│                      │    │                      │
+│ Span #4:             │    │ Span #5:             │
+│ "inventory.check"    │    │ "payment.process"    │
+│ parent: span-003     │    │ parent: span-003     │
+│ start: 10:00:00.150  │    │ start: 10:00:00.150  │
+│                      │    │                      │
+│ ↓ Query to DB        │    │ ↓ Call External API  │
+│                      │    │                      │
+│ Span #6:             │    │ Span #7:             │
+│ "db.query"           │    │ "http.external"      │
+│ parent: span-004     │    │ parent: span-005     │
+│ duration: 120ms      │    │ duration: 800ms ⚠️   │
+│                      │    │ status: error ❌     │
+│                      │    │                      │
+└──────────────────────┘    └──────────────────────┘
+```
+
+### Результат: Дерево трассировки
+
+```
+Trace ID: abc123xyz
+Duration: 1.2s
+Status: ERROR ❌
+
+├─ Span #1: POST /api/checkout (Frontend)
+│  └─ Span #2: gateway.process (API Gateway)
+│     └─ Span #3: order.create (Order Service)
+│        ├─ Span #4: inventory.check (Inventory Service)
+│        │  └─ Span #6: db.query (Database) [120ms] ✅
+│        │
+│        └─ Span #5: payment.process (Payment Service)
+│           └─ Span #7: http.external (External API) [800ms] ❌ ERROR!
+```
+
+---
+
+## 🚨 Часть 2: Обнаружение проблемы
+
+### Шаг 1: Метрики показывают аномалию
+
+```
+📈 GRAFANA DASHBOARD - Prometheus Metrics
+
+┌─────────────────────────────────────────────────────────┐
+│ 🔴 HTTP Request Duration (P95)                          │
+│                                                         │
+│  3s ┤                                          ╭──●     │ ← Скачок!
+│     │                                      ╭───╯        │
+│  2s ┤                                  ╭───╯            │
+│     │                              ╭───╯                │
+│  1s ┤──────────────────────────────╯                    │
+│     │                                                   │
+│  0s └──────────────────────────────────────────────────┤
+│     10:00      10:05      10:10      10:15             │
+│                                                         │
+│ ⚠️  Anomaly detected at 10:15!                          │
+│ Service: payment-service                                │
+│ Latency jumped from 100ms to 2.5s                      │
+└─────────────────────────────────────────────────────────┘
+
+Действие: Нажимаем на точку графика (exemplar) 👆
+```
+
+### Шаг 2: Открывается конкретная трассировка
+
+```
+🔍 TEMPO - Trace View
+
+┌─────────────────────────────────────────────────────────────┐
+│ Trace ID: abc123xyz                                         │
+│ Duration: 1.2s (SLOW! ⚠️)                                   │
+│ Status: ERROR ❌                                            │
+│ Time: 2025-12-12 10:15:23                                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ Timeline View:                                              │
+│                                                             │
+│ 0ms                                    800ms          1200ms│
+│ ├──────────────────────────────────────┴──────────────────┤│
+│ │                                                          ││
+│ ├─ Frontend ────────────────────────────────────────────┐  ││
+│ │  └─ API Gateway ──────────────────────────────────┐   │  ││
+│ │     └─ Order Service ──────────────────────────┐  │   │  ││
+│ │        ├─ Inventory ──────┐ ✅ (120ms)         │  │   │  ││
+│ │        │                  │                    │  │   │  ││
+│ │        └─ Payment ────────────────────────────┐│  │   │  ││
+│ │           └─ External API ─────────────────●  ││  │   │  ││
+│ │                                    ↑          ││  │   │  ││
+│ │                              800ms TIMEOUT!   ││  │   │  ││
+│ │                              ❌ ERROR         ││  │   │  ││
+│ └────────────────────────────────────────────────┴──┴───┘  ││
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+Визуально видно: Payment Service → External API тормозит!
+```
+
+### Шаг 3: Детали проблемного span'а
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 📍 Span Details: http.external                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ Service: payment-service                                    │
+│ Operation: POST /payment-gateway/charge                     │
+│ Duration: 800ms ⚠️                                          │
+│ Status: ERROR ❌                                            │
+│                                                             │
+│ ▼ Span Attributes:                                          │
+│   span.http.method = "POST"                                │
+│   span.http.url = "https://payment.external.com/charge"    │
+│   span.http.status_code = 504                              │
+│   span.http.timeout = "30s"                                │
+│   error.type = "GatewayTimeout"                            │
+│   error.message = "Connection timeout after 800ms"         │
+│                                                             │
+│ ▼ Resource Attributes:                                      │
+│   resource.service.name = "payment-service"                │
+│   resource.service.version = "2.3.1"                       │
+│   resource.k8s.pod.name = "payment-pod-7f8b9c"            │
+│   resource.k8s.namespace = "production"                    │
+│                                                             │
+│ ┌───────────────────────────────────────────────┐          │
+│ │ 🔗 Actions:                                   │          │
+│ │                                               │          │
+│ │ [📋 Logs for this span]  ← Нажимаем сюда!   │          │
+│ │ [📊 Related metrics]                         │          │
+│ │ [📤 Export trace as JSON]                    │          │
+│ └───────────────────────────────────────────────┘          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📝 Часть 3: Переход к логам
+
+### Шаг 4: Автоматический переход в Loki
+
+```
+🔍 LOKI - Logs Explorer
+
+Автоматически сгенерированный запрос:
+┌─────────────────────────────────────────────────────────────┐
+│ {service_name="payment-service", namespace="production"}    │
+│ | json                                                       │
+│ | traceID="abc123xyz" or spanID="span-005"                  │
+│ | line_format "{{.timestamp}} {{.level}} {{.message}}"      │
+└─────────────────────────────────────────────────────────────┘
+
+Результаты:
+┌─────────────────────────────────────────────────────────────┐
+│ 📄 Logs (последние 10 минут)                               │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ 10:15:22.950 INFO  Starting payment processing             │
+│   traceID: abc123xyz                                        │
+│   spanID: span-005                                          │
+│   user: user_12345                                          │
+│   amount: 149.99 USD                                        │
+│                                                             │
+│ 10:15:23.100 DEBUG Connecting to payment gateway           │
+│   url: https://payment.external.com                         │
+│   timeout: 30s                                              │
+│                                                             │
+│ 10:15:23.750 WARN  Connection slow, attempt 1/3            │
+│   elapsed: 650ms                                            │
+│   status: waiting                                           │
+│                                                             │
+│ 10:15:23.900 ERROR Payment gateway timeout! ❌             │
+│   traceID: abc123xyz                                        │
+│   spanID: span-005                                          │
+│   error: "Connection timeout after 800ms"                   │
+│   gateway_ip: 203.0.113.45                                  │
+│   network_latency: 750ms ← ПРОБЛЕМА ЗДЕСЬ!                │
+│   context: "High network latency to external provider"     │
+│                                                             │
+│ 10:15:23.950 INFO  Initiating retry with exponential       │
+│                    backoff                                  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+💡 Находим root cause: Высокая сетевая задержка до внешнего провайдера!
+```
+
+---
+
+## 🔄 Часть 4: Полный цикл отладки
+
+### Workflow от начала до конца
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1️⃣  ОБНАРУЖЕНИЕ (Detection)                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ 📊 Prometheus Alert:                                        │
+│    "HTTP latency P95 > 1s for 5 minutes"                   │
+│                                                             │
+│ 📈 Grafana Dashboard:                                       │
+│    График показывает скачок latency в 10:15                │
+│                                                             │
+│ ⏱️  SLO нарушен: 95% запросов должны быть < 500ms          │
+│    Текущий P95: 2.5s ❌                                     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 2️⃣  ИССЛЕДОВАНИЕ (Investigation)                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ Действия:                                                   │
+│ • Клик на exemplar (точку на графике) → Tempo              │
+│ • Открывается trace abc123xyz                              │
+│ • Визуально видим: Payment Service тормозит                │
+│                                                             │
+│ TraceQL запросы для анализа:                                │
+│                                                             │
+│ 1. Сколько таких проблем?                                   │
+│    { resource.service.name = "payment-service"              │
+│      && status = error                                      │
+│      && duration > 500ms }                                  │
+│    | count_over_time()                                      │
+│    Результат: 847 ошибок за последний час ⚠️               │
+│                                                             │
+│ 2. Какие эндпоинты затронуты?                               │
+│    { resource.service.name = "payment-service"              │
+│      && status = error }                                    │
+│    | rate() by (span.http.route)                           │
+│    Результат: Только /charge эндпоинт                       │
+│                                                             │
+│ 3. Когда началось?                                          │
+│    Смотрим на timeline: с 10:10 (~5 минут назад)           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 3️⃣  ДЕТАЛИЗАЦИЯ (Deep Dive)                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ Клик "Logs for this span" → Loki                           │
+│                                                             │
+│ Находим в логах:                                            │
+│ • Конкретное сообщение об ошибке                            │
+│ • Контекст: network_latency = 750ms                        │
+│ • IP внешнего сервиса: 203.0.113.45                        │
+│ • Stack trace (если доступен)                              │
+│                                                             │
+│ Дополнительные запросы:                                     │
+│                                                             │
+│ В Loki:                                                     │
+│ {service_name="payment-service"}                           │
+│ | json                                                       │
+│ | error_type="GatewayTimeout"                               │
+│ | stats count() by network_latency                          │
+│                                                             │
+│ Паттерн: Все ошибки имеют latency > 700ms                  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 4️⃣  ROOT CAUSE ANALYSIS                                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ Проверяем метрики сети:                                     │
+│                                                             │
+│ В Prometheus:                                               │
+│ network_latency_seconds{                                    │
+│   destination="payment.external.com"                        │
+│ }                                                           │
+│                                                             │
+│ График показывает:                                          │
+│  800ms ┤                              ╭────────●           │
+│  600ms ┤                          ╭───╯                     │
+│  400ms ┤                      ╭───╯                         │
+│  200ms ┤──────────────────────╯                             │
+│      0 └────────────────────────────────────────            │
+│        10:00   10:05   10:10   10:15                        │
+│                           ↑                                 │
+│                     Началось здесь!                         │
+│                                                             │
+│ 🎯 ROOT CAUSE FOUND:                                        │
+│    Деградация сети к внешнему payment провайдеру            │
+│    Началась в 10:10, критично с 10:15                      │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 5️⃣  РЕШЕНИЕ (Resolution)                                    │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ Краткосрочное решение:                                      │
+│ • Переключить трафик на backup payment provider            │
+│ • Увеличить timeout с 800ms до 2s временно                 │
+│                                                             │
+│ Долгосрочное решение:                                       │
+│ • Настроить circuit breaker для быстрого failover          │
+│ • Добавить retry с exponential backoff                      │
+│ • Настроить алерт на network_latency                       │
+│                                                             │
+│ Мониторинг после фикса:                                     │
+│ • Трассировки показывают: latency вернулась к норме        │
+│ • Метрики: P95 < 200ms ✅                                   │
+│ • Error rate: < 0.1% ✅                                     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🎯 Часть 5: Практические сценарии
+
+### Сценарий A: Медленный API эндпоинт
+
+```
+ПРОБЛЕМА:
+Пользователи жалуются: "Страница загружается 5 секунд!"
+
+ШАГ 1: Метрики
+┌──────────────────────────────────────┐
+│ http_request_duration_seconds        │
+│ {endpoint="/api/products"}           │
+│                                      │
+│ P95: 4.8s ❌ (норма: 200ms)         │
+└──────────────────────────────────────┘
+
+ШАГ 2: TraceQL запрос
+{ span.http.url =~ "/api/products.*" 
+  && duration > 1s }
+| avg_over_time(duration) 
+  by (span.http.route, resource.service.name)
+
+Результат:
+/api/products/{id} в "product-service" = 4.2s
+
+ШАГ 3: Открываем конкретную трассировку
+Trace abc789:
+├─ API Gateway: 50ms ✅
+└─ Product Service: 4.1s ⚠️
+   └─ Database Query: 4.0s ❌ ← ПРОБЛЕМА!
+      SQL: "SELECT * FROM products 
+            JOIN images 
+            JOIN reviews 
+            JOIN ratings..."
+
+ШАГ 4: Логи
+{service="product-service"} 
+| json 
+| sql_duration > 3
+
+Лог:
+"SLOW QUERY: 4.0s - Missing index on products.category_id"
+
+РЕШЕНИЕ:
+CREATE INDEX idx_products_category ON products(category_id);
+
+РЕЗУЛЬТАТ:
+• Latency: 4.8s → 180ms ✅
+• User satisfaction: ↑ 95%
+```
+
+### Сценарий B: Каскадные ошибки
+
+```
+ПРОБЛЕМА:
+Массовые ошибки во всех сервисах одновременно
+
+ШАГ 1: Service Graph
+┌─────────────────────────────────────────┐
+│ Frontend ──> API Gateway ──> Auth ❌    │
+│                          |               │
+│                          ├──> Orders ❌  │
+│                          └──> Cart ❌    │
+│                                          │
+│ Все сервисы красные!                    │
+└─────────────────────────────────────────┘
+
+ШАГ 2: TraceQL анализ
+// Найти общий паттерн
+{ status = error } 
+>> { resource.service.name = "auth-service" }
+
+Результат: 100% ошибок проходят через Auth!
+
+ШАГ 3: Трассировка через Auth
+Trace def456:
+├─ Frontend: OK ✅
+└─ API Gateway: OK ✅
+   └─ Auth Service: ERROR ❌
+      └─ Database: CONNECTION REFUSED ❌
+         error: "Too many connections (max: 100)"
+
+ШАГ 4: Корреляция с метриками
+database_connections{service="auth-service"}
+График: Достигли лимита 100 connections
+
+РЕШЕНИЕ:
+• Увеличить max_connections до 200
+• Добавить connection pooling
+• Настроить connection timeout
+
+РЕЗУЛЬТАТ:
+• Каскадные ошибки устранены
+• System stability восстановлена
+```
+
+### Сценарий C: Memory Leak детекция
+
+```
+ПРОБЛЕМА:
+Сервис периодически падает с OOMKilled
+
+ШАГ 1: Метрики показывают паттерн
+memory_usage_bytes{pod="payment-7f8b9c"}
+График: Плавный рост → Crash → Restart → Рост...
+
+ШАГ 2: Корреляция с трассировками
+// Найти операции перед крашем
+{ resource.k8s.pod.name = "payment-7f8b9c" 
+  && duration > 5s }
+
+Паттерн: Crash происходит после batch processing
+
+ШАГ 3: Детальная трассировка batch job
+Trace batch-123:
+├─ Batch Start: 0ms
+├─ Load Items: 100ms (items: 50,000 ⚠️)
+├─ Process Item 1: 50ms
+├─ Process Item 2: 51ms
+├─ Process Item 3: 52ms ← duration растёт!
+└─ ...
+   Memory: 512MB → 1.2GB → 1.8GB → OOM ❌
+
+ШАГ 4: Логи + Code Review
+Лог: "Processing batch of 50,000 items in memory"
+
+Code:
+items = db.query("SELECT * FROM orders") // 😱
+for item in items:
+    process(item)  // Все в памяти!
+
+РЕШЕНИЕ:
+// Streaming вместо bulk load
+for item in db.query_stream("SELECT...", batch=100):
+    process(item)
+
+РЕЗУЛЬТАТ:
+• Memory usage стабильна
+• No more crashes
+• Performance ↑ 3x
+```
+
+---
+
+## 📚 Часть 6: Чеклист для отладки
+
+```
+✅ ЧЕКЛИСТ ОТЛАДКИ С ТРАССИРОВКАМИ
+
+1️⃣  PREPARATION (Подготовка)
+    □ Все сервисы инструментированы
+    □ Trace context propagation настроен
+    □ Логи содержат traceID/spanID
+    □ Dashboards настроены
+
+2️⃣  DETECTION (Обнаружение)
+    □ Alert получен или аномалия замечена
+    □ Проверены основные метрики (RED)
+    □ Определён временной диапазон проблемы
+
+3️⃣  INITIAL INVESTIGATION (Начальное исследование)
+    □ Открыт exemplar trace из метрик
+    □ Визуально изучена timeline трассировки
+    □ Определён проблемный сервис/операция
+
+4️⃣  DEEP DIVE (Глубокий анализ)
+    □ Изучены атрибуты проблемного span'а
+    □ Проверены логи через "Logs for this span"
+    □ Найдено error message и stack trace
+
+5️⃣  PATTERN ANALYSIS (Анализ паттернов)
+    □ TraceQL запрос: сколько похожих случаев?
+    □ Когда началось / как часто происходит?
+    □ Какие эндпоинты/пользователи затронуты?
+
+6️⃣  ROOT CAUSE (Поиск первопричины)
+    □ Проверена корреляция с другими метриками
+    □ Изучена сетевая латентность
+    □ Проверено состояние зависимостей (DB, cache)
+    □ Проверены ресурсы (CPU, Memory, Disk)
+
+7️⃣  SOLUTION (Решение)
+    □ Hotfix применён (если срочно)
+    □ Мониторинг восстановления
+    □ Планирование долгосрочного решения
+    □ Постmortem документация
+
+8️⃣  PREVENTION (Предотвращение)
+    □ Добавлены алерты для early warning
+    □ Улучшены circuit breakers / retries
+    □ Обновлены runbooks
+    □ Проведено обучение команды
+```
+
+---
+
+## 🎓 Ключевые выводы
+
+### 3 столпа наблюдаемости работают вместе:
+
+```
+   МЕТРИКИ          ТРАССИРОВКИ           ЛОГИ
+      ↓                  ↓                  ↓
+  "ЧТО случилось"   "ГДЕ случилось"   "ПОЧЕМУ случилось"
+      ↓                  ↓                  ↓
+   Алерт:          Визуализация:      Детали:
+   Latency↑        Payment→Gateway    "timeout 800ms"
+                   800ms delay        network issue
+```
+
+### Workflow в одной строке:
+```
+Alert → Metrics → Exemplar → Trace → Span Details → Logs → Root Cause → Fix
+```
+
+### Золотые правила:
+1. **Всегда начинайте с метрик** - они покажут "что"
+2. **Используйте трассировки для локализации** - они покажут "где"
+3. **Идите в логи за деталями** - они покажут "почему"
+4. **Документируйте паттерны** - история учит
+
+---
+
+💡 **Сохраните этот документ** - он будет вашим руководством при следующем инциденте!
+
+🔗 **Поделитесь с командой** - единое понимание = быстрое решение проблем!

@@ -1,0 +1,393 @@
+TraceQL Cheat Sheet 🔍
+Шпаргалка по языку запросов Grafana Tempo
+
+📋 Основные концепции
+Структура трассировки
+Trace (трассировка)
+├─ trace_id: уникальный ID всей трассировки
+└─ Spans (отрезки)
+   ├─ span_id: уникальный ID операции
+   ├─ parent_id: ID родительского span'а
+   ├─ start/end: временные метки
+   └─ attributes: метаданные
+
+
+🏷️ Типы полей
+Встроенные поля (Intrinsic Fields)
+Базовая информация о span'ах, доступная всегда:
+Поле
+Описание
+Примеры значений
+status
+Статус выполнения
+ok, error, unset
+statusMessage
+Текст статуса
+"Internal Server Error"
+duration
+Длительность span'а
+100ms, 2s
+name
+Имя операции
+"GET /api/users"
+kind
+Тип span'а
+server, client, internal, producer, consumer
+traceDuration
+Длительность всей трассировки
+500ms
+rootName
+Имя корневого span'а
+"frontend"
+rootServiceName
+Имя корневого сервиса
+"api-gateway"
+
+Поля атрибутов (Attribute Fields)
+Span атрибуты - добавляются приложением:
+span.http.method          // HTTP метод
+span.http.status_code     // HTTP код ответа
+span.http.url             // URL запроса
+span.db.system            // Тип БД (postgresql, mysql)
+span.db.statement         // SQL запрос
+span.user.id              // ID пользователя
+
+Resource атрибуты - описывают сервис:
+resource.service.name         // Имя сервиса
+resource.service.version      // Версия
+resource.k8s.namespace.name   // Kubernetes namespace
+resource.k8s.pod.name         // Имя pod'а
+resource.host.name            // Имя хоста
+resource.container.id         // ID контейнера
+
+💡 Совет: Используйте . в начале, если не знаете тип атрибута:
+.http.method    // Найдёт span.http.method или resource.http.method
+
+
+🔍 Операторы сравнения
+Оператор
+Описание
+Пример
+=
+Равно
+{ status = error }
+!=
+Не равно
+{ span.http.method != "GET" }
+>
+Больше
+{ duration > 100ms }
+>=
+Больше или равно
+{ span.http.status_code >= 400 }
+<
+Меньше
+{ duration < 50ms }
+<=
+Меньше или равно
+{ span.http.status_code <= 299 }
+=~
+Regex совпадение
+{ span.http.url =~ "/api/.*" }
+!~
+Regex НЕ совпадает
+{ span.http.url !~ ".*health.*" }
+
+
+🧩 Логические операторы
+Внутри одного блока {}
+// AND - все условия должны выполняться
+{ span.http.method = "POST" && duration > 500ms }
+{ status = error && resource.service.name = "payment-service" }
+
+// OR - хотя бы одно условие
+{ span.http.status_code = 500 || span.http.status_code = 503 }
+
+Между блоками
+// AND между наборами span'ов
+{ status = error } && { duration > 1s }
+
+// OR между наборами span'ов
+{ status = error } || { duration > 2s }
+
+
+🌳 Структурные операторы
+> - Прямой потомок (child)
+// Найти span'ы, где frontend НАПРЯМУЮ вызывает database
+{ resource.service.name = "frontend" } > { span.db.system = "postgresql" }
+
+┌─ frontend ─┐
+└──> database ─┘  ✅ Найдено!
+
+>> - Любой потомок (descendant)
+// Найти span'ы, где frontend вызывает database (возможно через другие сервисы)
+{ resource.service.name = "frontend" } >> { span.db.system = "postgresql" }
+
+┌─ frontend ─┐
+└──> checkout ─┐
+    └──> database ─┘  ✅ Найдено!
+
+~ - Соседние span'ы (siblings)
+// Найти параллельные вызовы
+{ resource.service.name = "inventory" } ~ { resource.service.name = "pricing" }
+
+┌─ parent ─┐
+├──> inventory ─┘  ✅
+└──> pricing ───┘  ✅ Оба siblings!
+
+
+📊 Функции агрегации (Tempo 2.4+)
+Базовые метрики
+// Частота запросов (requests per second)
+{ } | rate() by (resource.service.name)
+
+// Количество span'ов за период
+{ status = error } | count_over_time() by (span.http.status_code)
+
+// Средняя длительность
+{ span.http.method = "POST" } | avg_over_time(duration) by (span.http.route)
+
+// Сумма значений
+{ } | sum_over_time(span.db.rows_affected) by (resource.service.name)
+
+// Минимум/Максимум
+{ } | min_over_time(duration)
+{ } | max_over_time(duration)
+
+Квантили и гистограммы
+// 95-й перцентиль latency
+{ } | quantile_over_time(duration, 0.95) by (resource.service.name)
+
+// 50-й (медиана), 90-й, 99-й перцентили
+{ } | quantile_over_time(duration, 0.50)
+{ } | quantile_over_time(duration, 0.90)
+{ } | quantile_over_time(duration, 0.99)
+
+// Гистограмма
+{ } | histogram_over_time(duration) by (span.http.route)
+
+Ранжирование (Tempo 2.5+)
+// Топ-5 самых медленных эндпоинтов
+{ } | avg_over_time(duration) by (span.http.route) | topk(5)
+
+// 10 сервисов с наибольшим количеством ошибок
+{ status = error } | rate() by (resource.service.name) | topk(10)
+
+// Топ-3 самых быстрых операций
+{ } | avg_over_time(duration) by (name) | bottomk(3)
+
+Сравнение
+// Сравнить метрики между периодами
+{ } | rate() | compare(1h)
+
+
+💼 Практические примеры
+🔴 Поиск ошибок
+// Все ошибки
+{ status = error }
+
+// Ошибки 5xx в API
+{ span.http.status_code >= 500 }
+
+// Ошибки в конкретном сервисе
+{ status = error && resource.service.name = "payment-service" }
+
+// Ошибки в определённом эндпоинте
+{ status = error && span.http.url =~ "/api/checkout.*" }
+
+⏱️ Анализ производительности
+// Медленные запросы (> 1 секунды)
+{ duration > 1s }
+
+// Медленные POST запросы
+{ span.http.method = "POST" && duration > 500ms }
+
+// Медленные запросы к БД
+{ span.db.system = "postgresql" && duration > 200ms }
+
+// Трассировки дольше 5 секунд
+{ traceDuration > 5s }
+
+🎯 Анализ конкретных операций
+// Все запросы к checkout
+{ span.http.url =~ ".*checkout.*" }
+
+// Все запросы конкретного пользователя
+{ span.user.id = "user_12345" }
+
+// Запросы из production окружения
+{ resource.deployment.environment = "production" }
+
+// SQL запросы с SELECT
+{ span.db.statement =~ "SELECT.*" }
+
+🔗 Анализ взаимодействий
+// Frontend вызывает любую БД
+{ resource.service.name = "frontend" } >> { span.db.system != "" }
+
+// API Gateway -> Auth -> Payment (цепочка)
+{ resource.service.name = "api-gateway" } 
+  >> { resource.service.name = "auth-service" }
+  >> { resource.service.name = "payment-service" }
+
+// Параллельные вызовы inventory и pricing
+{ resource.service.name = "inventory" } ~ { resource.service.name = "pricing" }
+
+📈 RED метрики (Rate, Errors, Duration)
+// Rate - частота запросов
+{ resource.service.name = "checkout-service" } | rate()
+
+// Errors - частота ошибок
+{ resource.service.name = "checkout-service" && status = error } | rate()
+
+// Duration - средняя длительность
+{ resource.service.name = "checkout-service" } | avg_over_time(duration)
+
+// Всё вместе с группировкой
+{ } | rate() by (resource.service.name, span.http.route)
+{ status = error } | rate() by (resource.service.name)
+{ } | quantile_over_time(duration, 0.95) by (resource.service.name)
+
+🐛 Отладка конкретной проблемы
+// Медленные запросы с ошибками
+{ duration > 1s && status = error }
+
+// Таймауты в payment service
+{ resource.service.name = "payment-service" 
+  && span.http.status_code = 504 }
+
+// Deadlock'и в БД
+{ span.db.system = "postgresql" 
+  && statusMessage =~ ".*deadlock.*" }
+
+// Запросы, проходящие через более 5 сервисов
+{ } | count() by (trace_id) > 5
+
+
+🎨 Группировка и фильтрация
+Group by (группировка)
+// По имени сервиса
+{ } | rate() by (resource.service.name)
+
+// По HTTP методу и эндпоинту
+{ } | avg_over_time(duration) by (span.http.method, span.http.route)
+
+// По статус-коду
+{ } | count_over_time() by (span.http.status_code)
+
+// По namespace в Kubernetes
+{ } | rate() by (resource.k8s.namespace.name)
+
+
+⚡ Полезные паттерны
+Healthcheck исключения
+// Исключить health checks из анализа
+{ span.http.url !~ ".*health.*" && span.http.url !~ ".*ping.*" }
+
+Анализ по временным диапазонам
+// Используйте Time Range Picker в Grafana для выбора периода
+// Затем анализируйте трассировки в этом периоде
+
+Поиск аномалий
+// Запросы, которые намного медленнее обычного
+{ duration > 2s }
+
+// Необычные статус-коды
+{ span.http.status_code >= 400 && span.http.status_code < 600 }
+
+// Повторные попытки
+{ span.retry.count > 0 }
+
+
+🚀 Оптимизация запросов
+✅ Лучшие практики
+// ✅ ХОРОШО: Явное указание префиксов
+{ span.http.method = "POST" }
+{ resource.service.name = "payment-service" }
+
+// ✅ ХОРОШО: Специфичные условия
+{ resource.service.name = "payment-service" && duration > 100ms }
+
+// ✅ ХОРОШО: Использование индексированных полей
+{ status = error }  // status индексируется
+
+❌ Избегайте
+// ⚠️ МЕДЛЕННО: Без префиксов (если не нужно)
+{ .http.method = "POST" }
+
+// ⚠️ МЕДЛЕННО: Слишком широкие условия
+{ duration > 0 }  // Вернёт почти всё
+
+// ⚠️ МЕДЛЕННО: Сложные regex без якорей
+{ span.http.url =~ ".*" }  // Слишком общее
+
+
+📚 Частые сценарии
+Мониторинг SLO/SLA
+// Запросы быстрее 200ms (успех для SLO)
+{ duration < 200ms } | count_over_time()
+
+// Процент успешных запросов
+{ status = ok } | rate() / { } | rate()
+
+// P95 latency для критичных эндпоинтов
+{ span.http.route = "/api/checkout" } 
+  | quantile_over_time(duration, 0.95)
+
+Capacity Planning
+// Самые нагруженные сервисы
+{ } | rate() by (resource.service.name) | topk(10)
+
+// Эндпоинты с наибольшим потреблением времени
+{ } | sum_over_time(duration) by (span.http.route) | topk(5)
+
+Incident Response
+// Когда началась проблема?
+{ status = error && resource.service.name = "payment-service" }
+
+// Какие сервисы затронуты?
+{ status = error } | rate() by (resource.service.name)
+
+// Корреляция с другими проблемами
+{ status = error } >> { status = error }
+
+
+🔗 Интеграция с другими инструментами
+Связь с логами (Loki)
+// Найти трассировку, затем посмотреть логи с тем же trace_id
+// В Grafana: клик на span -> "Logs for this span"
+
+Связь с метриками (Prometheus)
+// Использовать TraceQL metrics для создания алертов в Prometheus
+// Или Service Graph для визуализации зависимостей
+
+
+💡 Советы и трюки
+Начинайте с простого: Сначала найдите трассировки, затем уточняйте
+
+ { status = error }  // Начать отсюда
+{ status = error && resource.service.name = "payment" }  // Уточнить
+
+
+Используйте Service Graph: Для понимания архитектуры системы
+
+
+Экспортируйте интересные трассировки: JSON export для детального анализа
+
+
+Комбинируйте с Logs: Trace ID в логах → быстрый переход к трассировке
+
+
+Создавайте дашборды: Сохраняйте полезные запросы в Grafana
+
+
+
+📖 Дополнительные ресурсы
+Официальная документация: https://grafana.com/docs/tempo/latest/traceql/
+Примеры запросов: https://grafana.com/blog/traceql-examples/
+TraceQL Playground: Используйте Grafana для экспериментов
+
+Версия: Tempo 2.5+ (декабрь 2025)
+ Совместимость: Grafana 10.4+
+💡 Совет: Сохраните эту шпаргалку и держите под рукой при работе с Tempo!
+
